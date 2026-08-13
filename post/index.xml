@@ -81,7 +81,110 @@ CLI 方案通过将 &lt;strong&gt;“指令生成”&lt;/strong&gt; 与 &lt;stro
 &lt;h2 id="五-协议向左接口向右"&gt;五、 协议向左，接口向右
 &lt;/h2&gt;&lt;p&gt;MCP 并没有消失，它或许将作为一种&lt;strong&gt;企业级规范&lt;/strong&gt;存在于需要多租户隔离、强审计的受控环境中。&lt;/p&gt;
 &lt;p&gt;然而，对于个人开发者的本地工作流来说，CLI 似乎已经是利用 LLM 生成的文本数据执行任务的一个很完美的答案了，它利用了 LLM 预训练阶段沉淀的编程知识，规避了新的繁琐的协议负担。&lt;br&gt;
-AI 时代，可能不再需要为机器造诸如MCP的新语言，通过 CLI，可以让人类已经沉淀了数十年的指令语言在LLM中大放异彩。&lt;/p&gt;</description></item><item><title>从Xring O1说开来</title><link>https://baceoog.github.io/blog/p/%E4%BB%8Exring-o1%E8%AF%B4%E5%BC%80%E6%9D%A5/</link><pubDate>Wed, 09 Jul 2025 21:56:37 +0800</pubDate><guid>https://baceoog.github.io/blog/p/%E4%BB%8Exring-o1%E8%AF%B4%E5%BC%80%E6%9D%A5/</guid><description>&lt;h2 id="玄戒o1芯片架构"&gt;玄戒O1芯片架构
+AI 时代，可能不再需要为机器造诸如MCP的新语言，通过 CLI，可以让人类已经沉淀了数十年的指令语言在LLM中大放异彩。&lt;/p&gt;</description></item><item><title>Quantization</title><link>https://baceoog.github.io/blog/p/quantization/</link><pubDate>Wed, 09 Jul 2025 23:06:03 +0800</pubDate><guid>https://baceoog.github.io/blog/p/quantization/</guid><description>&lt;h2 id="疑惑"&gt;疑惑
+&lt;/h2&gt;&lt;h3 id="pytorch平台上对rwkv的困惑度计算模块进行量化的经历"&gt;Pytorch平台上对RWKV的困惑度计算模块进行量化的经历
+&lt;/h3&gt;&lt;p&gt;Q:更稳妥的方式是在模型加载和量化后，将整个模型转为float32，再量化后转换成float32的目的是什么呢，这样不是把原来量化好的给毁了吗&lt;br&gt;
+A：&lt;/p&gt;
+&lt;h4 id="pytorch上量化做了什么"&gt;pytorch上量化做了什么
+&lt;/h4&gt;&lt;p&gt;当调用torch.quantization.quantize_dynamic时，PyTorch并不仅仅是把权重张量的数据类型（dtype）改了一下。它做了一件更根本的事：它将模型中的标准nn.Linear层替换成了一个全新的、专门的模块，叫做DynamicQuantizedLinear。&lt;br&gt;
+在这个新的DynamicQuantizedLinear模块内部，权重确实被压缩并以**torch.qint8（8位整型）**的格式存储了起来。&lt;br&gt;
+同时，这个模块还保存了将这些INT8整数反量化回浮点数所需的缩放因子（scale）和零点（zero-point）（它们是浮点数）。&lt;/p&gt;
+&lt;h4 id="totorchfloat32-到底做了什么"&gt;.to(torch.float32) 到底做了什么？
+&lt;/h4&gt;&lt;p&gt;当您对一个模型调用.to(dtype)方法时，PyTorch会遍历模型的所有参数（parameters）和缓冲区（buffers），并尝试将它们的类型转换为您指定的dtype。&lt;br&gt;
+这里的关键在于：.to() 方法只会转换浮点类型的张量（例如 bfloat16, float16, float64）。&lt;br&gt;
+它会跳过那些已经是**整型（Integer）**的张量，比如我们量化后存储为torch.qint8的权重。
+因此，INT8权重本身保持不变，量化的成果得以保留。&lt;/p&gt;
+&lt;h4 id="那我们为什么要执行这个转换呢"&gt;那我们为什么要执行这个转换呢？
+&lt;/h4&gt;&lt;p&gt;这个操作的目的，正是为了解决您在上一个问题中遇到的 &lt;code&gt;RuntimeError: expected scalar type Float but found BFloat16&lt;/code&gt; 错误。&lt;br&gt;
+让我们回顾一下当时的情况：&lt;br&gt;
+(1)&lt;strong&gt;原始模型&lt;/strong&gt;：您加载模型时，因为设置了&lt;code&gt;'dataformat': 'bf16'&lt;/code&gt;，所以模型中所有的浮点参数都是&lt;code&gt;bfloat16&lt;/code&gt;类型。这包括&lt;code&gt;Embedding&lt;/code&gt;层、&lt;code&gt;LayerNorm&lt;/code&gt;层，以及&lt;code&gt;Linear&lt;/code&gt;层的权重和偏置。
+(2)&lt;strong&gt;量化之后&lt;/strong&gt;：&lt;code&gt;quantize_dynamic&lt;/code&gt;函数只替换了&lt;code&gt;Linear&lt;/code&gt;层。但是，模型中的&lt;strong&gt;其他层&lt;/strong&gt;（如&lt;code&gt;Embedding&lt;/code&gt;和&lt;code&gt;LayerNorm&lt;/code&gt;）的参数&lt;strong&gt;依然是&lt;code&gt;bfloat16&lt;/code&gt;类型&lt;/strong&gt;。
+(3)&lt;strong&gt;冲突发生&lt;/strong&gt;：当数据流经模型时，&lt;code&gt;Embedding&lt;/code&gt;层输出一个&lt;code&gt;bfloat16&lt;/code&gt;的张量，这个张量被送入到我们新替换的&lt;code&gt;DynamicQuantizedLinear&lt;/code&gt;层。然而，这个量化层的CPU后端实现&lt;strong&gt;期望接收一个标准的&lt;code&gt;float32&lt;/code&gt;张量&lt;/strong&gt;作为输入，而不是&lt;code&gt;bfloat16&lt;/code&gt;。于是，类型不匹配，程序崩溃。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;所以，调用&lt;code&gt;model.to(torch.float32)&lt;/code&gt;的真正目的，是将模型中&lt;/strong&gt;除了INT8权重之外的所有其他浮点参数和缓冲区**（比如仍然是&lt;code&gt;bfloat16&lt;/code&gt;格式的&lt;code&gt;Embedding&lt;/code&gt;层或&lt;code&gt;LayerNorm&lt;/code&gt;层）全部统一转换为标准的&lt;code&gt;float32&lt;/code&gt;格式。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;总结一下，这个操作可以理解为一次“内务整理”：&lt;/strong&gt;&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;INT8权重&lt;/strong&gt;： untouchable，保持量化状态。&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;其他所有浮点部分（&lt;code&gt;bfloat16&lt;/code&gt;）&lt;/strong&gt;：全部转换为&lt;code&gt;float32&lt;/code&gt;。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这样一来，整个模型的数据流就统一了：非量化层输出&lt;code&gt;float32&lt;/code&gt;张量，量化层接收&lt;code&gt;float32&lt;/code&gt;张量，内部进行计算，从而完美解决了类型冲突的问题，同时保留了INT8量化带来的内存节省优势。&lt;/p&gt;
+&lt;h4 id="python中的enumereate"&gt;python中的enumereate
+&lt;/h4&gt;&lt;p&gt;(1) 没有 &lt;code&gt;enumerate&lt;/code&gt; 的情况
+您的原始循环是这样的：
+&lt;code&gt;for begin_loc in tqdm(range(0, 1536, 512)):&lt;/code&gt;&lt;/p&gt;
+&lt;p&gt;这个循环会执行三次，在每一次循环中：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;第1次循环&lt;/strong&gt;：&lt;code&gt;begin_loc&lt;/code&gt; 的值是 &lt;strong&gt;0&lt;/strong&gt;&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;第2次循环&lt;/strong&gt;：&lt;code&gt;begin_loc&lt;/code&gt; 的值是 &lt;strong&gt;512&lt;/strong&gt;&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;第3次循环&lt;/strong&gt;：&lt;code&gt;begin_loc&lt;/code&gt; 的值是 &lt;strong&gt;1024&lt;/strong&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;可以看到，这个循环只提供了一个变量 &lt;code&gt;begin_loc&lt;/code&gt;。&lt;/p&gt;
+&lt;p&gt;(2) 加入 &lt;code&gt;enumerate&lt;/code&gt; 之后的情况&lt;/p&gt;
+&lt;p&gt;您修改后的正确循环是这样的：
+&lt;code&gt;for idx, begin_loc in enumerate(tqdm(range(0, 1536, 512))):&lt;/code&gt;&lt;/p&gt;
+&lt;p&gt;这个循环同样会执行三次，在每一次循环中：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;第1次循环&lt;/strong&gt;：&lt;code&gt;idx&lt;/code&gt; 的值是 &lt;strong&gt;0&lt;/strong&gt;，&lt;code&gt;begin_loc&lt;/code&gt; 的值是 &lt;strong&gt;0&lt;/strong&gt;&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;第2次循环&lt;/strong&gt;：&lt;code&gt;idx&lt;/code&gt; 的值是 &lt;strong&gt;1&lt;/strong&gt;，&lt;code&gt;begin_loc&lt;/code&gt; 的值是 &lt;strong&gt;512&lt;/strong&gt;&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;第3次循环&lt;/strong&gt;：&lt;code&gt;idx&lt;/code&gt; 的值是 &lt;strong&gt;2&lt;/strong&gt;，&lt;code&gt;begin_loc&lt;/code&gt; 的值是 &lt;strong&gt;1024&lt;/strong&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;结论
+通过对比可以清晰地看到：&lt;br&gt;
+&lt;strong&gt;核心变量 &lt;code&gt;begin_loc&lt;/code&gt; 的值完全没变&lt;/strong&gt;：在每次对应的循环中，&lt;code&gt;begin_loc&lt;/code&gt; 得到的值和原来一模一样，都是 &lt;code&gt;0, 512, 1024, ...&lt;/code&gt;。所以您循环内部使用 &lt;code&gt;begin_loc&lt;/code&gt; 的所有逻辑都不会受到任何影响。&lt;br&gt;
+&lt;strong&gt;循环次数完全没变&lt;/strong&gt;：&lt;code&gt;range&lt;/code&gt; 函数生成多少个数字，循环就会执行多少次。&lt;code&gt;enumerate&lt;/code&gt; 不会增加或减少循环的次数。&lt;br&gt;
+&lt;strong&gt;唯一的改变&lt;/strong&gt;：&lt;code&gt;enumerate&lt;/code&gt; 只是为您&lt;strong&gt;额外提供&lt;/strong&gt;了一个从0开始的计数器变量 &lt;code&gt;idx&lt;/code&gt;。这个变量正是您在 &lt;code&gt;print&lt;/code&gt; 语句中所需要的，它解决了 &lt;code&gt;NameError&lt;/code&gt;，并且让您能方便地知道当前是第几步循环。&lt;br&gt;
+所以，加入 &lt;code&gt;enumerate&lt;/code&gt; 是一个纯粹的“增强”操作，它在不干扰原有功能的基础上，安全地添加了您需要的新功能（即步数索引）。这是在Python中进行带索引循环的标准且推荐的做法。&lt;/p&gt;
+&lt;h4 id="如果计算rwkv中的困惑度的呢"&gt;如果计算RWKV中的困惑度的呢
+&lt;/h4&gt;&lt;p&gt;核心思想是**“对比每一个字（Token）的输出与下一个真实字的关系”**&lt;br&gt;
+RWKV的困惑度计算的核心代码（先计算loss）：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-python" data-lang="python"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="k"&gt;with&lt;/span&gt; &lt;span class="n"&gt;torch&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;no_grad&lt;/span&gt;&lt;span class="p"&gt;():&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="n"&gt;logits&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;state&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;model&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;forward_parallel_slices&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;input&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;state&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;slice_len&lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="mi"&gt;1024&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="n"&gt;loss&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;F&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;cross_entropy&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;logits&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;view&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;-&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;logits&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;size&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;-&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;)),&lt;/span&gt; &lt;span class="n"&gt;output&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;h4 id="只进行推理计算不计算梯度--二者有什么区别吗"&gt;只进行推理计算，不计算梯度 二者有什么区别吗
+&lt;/h4&gt;&lt;p&gt;训练是为了教会模型，而推理是为了使用已经教好的模型&lt;br&gt;
+当然有，这两种模式在计算流程、资源消耗和最终目的上有着本质的区别。&lt;/p&gt;
+&lt;p&gt;简单来说，&lt;strong&gt;训练&lt;/strong&gt;是为了&lt;strong&gt;教会&lt;/strong&gt;模型，而&lt;strong&gt;推理&lt;/strong&gt;是为了&lt;strong&gt;使用&lt;/strong&gt;已经教好的模型。&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th style="text-align: left"&gt;特性 (Characteristic)&lt;/th&gt;
+&lt;th style="text-align: left"&gt;训练模式 (Training Mode)&lt;/th&gt;
+&lt;th style="text-align: left"&gt;推理模式 (Inference Mode)&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;核心目标&lt;/strong&gt;&lt;/td&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;学习和优化&lt;/strong&gt;模型参数（权重），让模型变得更“聪明”。&lt;/td&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;使用&lt;/strong&gt;已训练好的模型对新数据进行&lt;strong&gt;预测&lt;/strong&gt;和&lt;strong&gt;评估&lt;/strong&gt;。&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;计算流程&lt;/strong&gt;&lt;/td&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;前向传播 + 反向传播&lt;/strong&gt; (Forward Pass + Backward Pass)&lt;/td&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;仅有前向传播&lt;/strong&gt; (Forward Pass ONLY)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;梯度计算&lt;/strong&gt;&lt;/td&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;必须计算梯度&lt;/strong&gt;。梯度是反向传播的核心，它告诉每个权重应该如何调整才能减小误差（loss）。&lt;/td&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;完全不需要计算梯度&lt;/strong&gt;。因为模型参数是固定的，我们不打算更新它，所以计算梯度就成了不必要的开销。&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;内存占用&lt;/strong&gt;&lt;/td&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;高&lt;/strong&gt;。为了能够进行反向传播，PyTorch需要构建一个“计算图”，并&lt;strong&gt;保存所有中间步骤的计算结果&lt;/strong&gt;（激活值）。这会占用大量内存。&lt;/td&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;低&lt;/strong&gt;。因为不需要反向传播，PyTorch可以&lt;strong&gt;用完一个中间结果后立即丢弃&lt;/strong&gt;，无需为计算图保存任何额外信息，大大节省了内存。&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;计算速度&lt;/strong&gt;&lt;/td&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;慢&lt;/strong&gt;。既要跑一遍前向传播，又要跑一遍更复杂的反向传播。&lt;/td&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;快&lt;/strong&gt;。只执行一次前向传播，省去了所有与梯度相关的计算。&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td style="text-align: left"&gt;&lt;strong&gt;在PyTorch中的体现&lt;/strong&gt;&lt;/td&gt;
+&lt;td style="text-align: left"&gt;默认模式。执行&lt;code&gt;loss.backward()&lt;/code&gt;和&lt;code&gt;optimizer.step()&lt;/code&gt;来更新权重。&lt;/td&gt;
+&lt;td style="text-align: left"&gt;使用&lt;code&gt;with torch.no_grad():&lt;/code&gt;代码块包裹。同时常配合&lt;code&gt;model.eval()&lt;/code&gt;来关闭Dropout等只在训练时使用的层。&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;因此，在计算困惑度时，使用 &lt;code&gt;with torch.no_grad():&lt;/code&gt; 是一个重要的优化步骤，它能让评估过程变得更快、更节省资源。&lt;/p&gt;</description></item><item><title>从Xring O1说开来</title><link>https://baceoog.github.io/blog/p/%E4%BB%8Exring-o1%E8%AF%B4%E5%BC%80%E6%9D%A5/</link><pubDate>Wed, 09 Jul 2025 21:56:37 +0800</pubDate><guid>https://baceoog.github.io/blog/p/%E4%BB%8Exring-o1%E8%AF%B4%E5%BC%80%E6%9D%A5/</guid><description>&lt;h2 id="玄戒o1芯片架构"&gt;玄戒O1芯片架构
 &lt;/h2&gt;&lt;h3 id="芯片基础"&gt;芯片基础
 &lt;/h3&gt;&lt;p&gt;&lt;em&gt;&lt;strong&gt;CPU:&lt;/strong&gt;&lt;/em&gt; 基于ARMv9.2指令集架构的Cortex CPU集群&lt;br&gt;
 &lt;em&gt;&lt;strong&gt;GPU:&lt;/strong&gt;&lt;/em&gt; ARM的Immortalis GPU IP&lt;br&gt;
